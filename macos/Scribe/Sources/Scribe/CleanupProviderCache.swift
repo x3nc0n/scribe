@@ -53,6 +53,7 @@ final class CleanupProviderCache: Sendable {
         self.deadlineForCheck = checkDeadline
         self.checkTimer = checkTimer
         self.readinessTimer = readinessTimer
+        self.lifecycle.useSavedKeys { try store.localRetirementKey(for: $0) }
     }
 
     /// The provider for the configuration stored now: the cached one when the configuration matches, otherwise a new
@@ -260,7 +261,31 @@ final class CleanupProviderCache: Sendable {
             return CleanupConnectionCheck(
                 reachable: false, message: CleanupFailureText.forSettings(error, providerName: nil))
         }
-        return await checkConnection(for: connection, candidate: candidate)
+        let owner = LocalModelLifecycle.Candidate { [self] in
+            guard store.isEnabled else { return true }
+            guard let current = try? CleanupProviderResolver.connection(store: store, environment: environment) else {
+                return true
+            }
+            return !Self.usesSameLocalCopy(current, connection)
+        }
+        defer { owner.finish(in: lifecycle) }
+        return await LocalModelLifecycle.$candidate.withValue(owner) {
+            await checkConnection(for: connection, candidate: candidate)
+        }
+    }
+
+    static func usesSameLocalCopy(_ first: CleanupConnection, _ second: CleanupConnection) -> Bool {
+        guard first.source == .settings, second.source == .settings,
+            first.localServerApp == second.localServerApp,
+            first.localContextTokens == second.localContextTokens
+        else { return false }
+        guard case .openAICompatible(let firstURL, let firstModel, _, _) = first.target,
+            case .openAICompatible(let secondURL, let secondModel, _, _) = second.target
+        else { return false }
+        return LocalAiServer.appAt(firstURL.absoluteString) == .lmStudio
+            && LocalAiServer.appAt(secondURL.absoluteString) == .lmStudio
+            && LocalModelLifecycle.sameServer(firstURL.absoluteString, secondURL.absoluteString)
+            && LocalServerClient.sameModel(firstModel, secondModel)
     }
 
     private func checkConnection(

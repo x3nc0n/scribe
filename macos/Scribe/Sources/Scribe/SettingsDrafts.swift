@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// A kind of entry a Settings tab adds from its drafts.
@@ -7,9 +8,10 @@ enum SettingsDraftEntry: Hashable, Sendable {
     case appProfile
 }
 
-/// What the user has typed into Settings but not saved yet (a new dictionary rule, snippet or app profile, and the
-/// two secret fields), the word pack workspace, plus the section that was showing. The app owns this rather than
-/// the window: page navigation keeps pending input, and a normal close asks to save, discard or keep editing.
+/// What the user has typed into Settings but not saved yet (a new dictionary rule, snippet or app profile, the cleanup
+/// prompts and the secret fields), recording indicator choices, the word pack workspace and the section that was showing.
+/// The app owns this rather than the window: page navigation keeps pending input, and a normal close asks to save,
+/// discard or keep editing.
 /// Already-immediate macOS settings are not staged here; each tab reads those when it appears.
 ///
 /// A typed secret stays in memory until it is saved or cleared, or Scribe quits, as it did in a kept window. It is
@@ -32,6 +34,22 @@ final class SettingsDrafts: ObservableObject {
 
     @Published var openAIApiKey = ""
     @Published var azureClientSecret = ""
+    @Published var azureApiKey = ""
+    @Published var cleanupWritingStyle = CleanupPrompt.defaultWritingStyle
+    @Published var cleanupFrontierPrompt = CleanupPrompt.defaultFrontierPrompt
+    @Published var cleanupLocalPrompt = CleanupPrompt.defaultLocalPrompt
+    @Published var cleanupIdleMinutes = LocalModelDefaults.keepAliveMinutes
+    @Published private(set) var indicator: OverlayAnchorSelection?
+    private var indicatorObservation: AnyCancellable?
+
+    func configureIndicator(controller: OverlayPanelController, defaults: UserDefaults = .standard) {
+        guard indicator == nil else { return }
+        let model = OverlayAnchorSelection(controller: controller, defaults: defaults)
+        indicator = model
+        indicatorObservation = model.objectWillChange.sink { [weak self] in
+            self?.objectWillChange.send()
+        }
+    }
 
     // The app owns this draft too: changing pages must not destroy a word pack edit.
     @Published var wordPackWorkspace = LibraryWorkspace(libraries: [])
@@ -43,11 +61,16 @@ final class SettingsDrafts: ObservableObject {
     private var wordPacksLoading = false
     private var wordPackLoadRevision: UInt64 = 0
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+    private var savedCleanupWritingStyle = CleanupPrompt.defaultWritingStyle
+    private var savedCleanupFrontierPrompt = CleanupPrompt.defaultFrontierPrompt
+    private var savedCleanupLocalPrompt = CleanupPrompt.defaultLocalPrompt
+    private var savedCleanupIdleMinutes = LocalModelDefaults.keepAliveMinutes
     var saveOperation: (@MainActor (SettingsDrafts) async throws -> Void)?
     @Published private(set) var entriesBeingAdded: Set<SettingsDraftEntry> = []
 
     var unsavedSections: [String] {
         var sections: [String] = []
+        if indicator?.hasUnsavedChanges == true { sections.append("Dictation") }
         if wordPackWorkspace.hasUnsavedChanges { sections.append("Word packs") }
         if !dictionaryPattern.isEmpty || !dictionaryReplacement.isEmpty { sections.append("Dictionary") }
         if !snippetPhrase.isEmpty || !snippetTemplate.isEmpty { sections.append("Voice snippets") }
@@ -56,11 +79,29 @@ final class SettingsDrafts: ObservableObject {
         {
             sections.append("App profiles")
         }
-        if !openAIApiKey.isEmpty || !azureClientSecret.isEmpty { sections.append("AI cleanup") }
+        if hasUnsavedCleanupPromptChanges || hasUnsavedCleanupIdleTime
+            || !openAIApiKey.isEmpty || !azureClientSecret.isEmpty || !azureApiKey.isEmpty
+        {
+            sections.append("AI cleanup")
+        }
         return sections
     }
 
+    var hasUnsavedCleanupPromptChanges: Bool {
+        cleanupWritingStyle != savedCleanupWritingStyle
+            || cleanupFrontierPrompt != savedCleanupFrontierPrompt
+            || cleanupLocalPrompt != savedCleanupLocalPrompt
+    }
+
     var hasUnsavedChanges: Bool { !unsavedSections.isEmpty }
+
+    var hasUnsavedCleanupIdleTime: Bool { cleanupIdleMinutes != savedCleanupIdleMinutes }
+
+    func loadCleanupIdleTime(_ minutes: Int) {
+        guard !hasUnsavedCleanupIdleTime else { return }
+        savedCleanupIdleMinutes = minutes
+        cleanupIdleMinutes = minutes
+    }
     var isBusy: Bool { isSaving || !entriesBeingAdded.isEmpty }
 
     var footerText: String {
@@ -83,9 +124,42 @@ final class SettingsDrafts: ObservableObject {
     }
 
     func windowClosed() {
+        indicator?.cancelPreview()
+        indicator?.reload()
         wordPackLoadRevision &+= 1
         wordPacksLoading = false
         if !wordPackWorkspace.hasUnsavedChanges { wordPacksLoaded = false }
+    }
+
+    func loadCleanupPrompts(writingStyle: String, frontierPrompt: String, localPrompt: String) {
+        guard !hasUnsavedCleanupPromptChanges else { return }
+        let writingStyle = CleanupPrompt.effectiveOverride(
+            writingStyle, defaultValue: CleanupPrompt.defaultWritingStyle)
+        let frontierPrompt = CleanupPrompt.effectiveOverride(
+            frontierPrompt, defaultValue: CleanupPrompt.defaultFrontierPrompt)
+        let localPrompt = CleanupPrompt.effectiveOverride(
+            localPrompt, defaultValue: CleanupPrompt.defaultLocalPrompt)
+        savedCleanupWritingStyle = writingStyle
+        savedCleanupFrontierPrompt = frontierPrompt
+        savedCleanupLocalPrompt = localPrompt
+        cleanupWritingStyle = writingStyle
+        cleanupFrontierPrompt = frontierPrompt
+        cleanupLocalPrompt = localPrompt
+    }
+
+    func markCleanupPromptsSaved(writingStyle: String, frontierPrompt: String, localPrompt: String) {
+        savedCleanupWritingStyle = writingStyle
+        savedCleanupFrontierPrompt = frontierPrompt
+        savedCleanupLocalPrompt = localPrompt
+    }
+
+    func restoreCleanupWritingStyle() {
+        cleanupWritingStyle = CleanupPrompt.defaultWritingStyle
+    }
+
+    func restoreCleanupGuardrails() {
+        cleanupFrontierPrompt = CleanupPrompt.defaultFrontierPrompt
+        cleanupLocalPrompt = CleanupPrompt.defaultLocalPrompt
     }
 
     @discardableResult
@@ -120,6 +194,7 @@ final class SettingsDrafts: ObservableObject {
 
     func discard() {
         guard !isBusy else { return }
+        indicator?.discard()
         wordPackWorkspace.discard()
         dictionaryPattern = ""
         dictionaryReplacement = ""
@@ -132,6 +207,11 @@ final class SettingsDrafts: ObservableObject {
         profileNewlineMode = .smartFlatten
         openAIApiKey = ""
         azureClientSecret = ""
+        azureApiKey = ""
+        cleanupWritingStyle = savedCleanupWritingStyle
+        cleanupFrontierPrompt = savedCleanupFrontierPrompt
+        cleanupLocalPrompt = savedCleanupLocalPrompt
+        cleanupIdleMinutes = savedCleanupIdleMinutes
         saveFailed = false
         footerMessage = "Discarded unsaved changes."
     }
@@ -161,9 +241,16 @@ extension SettingsDrafts {
     func configureSave(
         store: PersistenceStore,
         libraries: DictionaryLibraryService,
+        cleanupSettings: CleanupSettingsStore = .live,
         onChanged: @escaping @MainActor () -> Void
     ) {
         saveOperation = { drafts in
+            let cleanupWritingStyle = drafts.cleanupWritingStyle
+            let cleanupFrontierPrompt = drafts.cleanupFrontierPrompt
+            let cleanupLocalPrompt = drafts.cleanupLocalPrompt
+            let saveCleanupPrompts = drafts.hasUnsavedCleanupPromptChanges
+            let cleanupIdleMinutes = drafts.cleanupIdleMinutes
+            let saveCleanupIdleTime = drafts.hasUnsavedCleanupIdleTime
             let nonblank: (String) -> Bool = { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             if drafts.unsavedSections.contains("Dictionary"),
                 !nonblank(drafts.dictionaryPattern) || !nonblank(drafts.dictionaryReplacement)
@@ -211,7 +298,7 @@ extension SettingsDrafts {
                 await model.addFromDrafts()
                 if let error = model.errorMessage { throw SettingsDraftSaveError(error) }
             }
-            if !drafts.openAIApiKey.isEmpty || !drafts.azureClientSecret.isEmpty {
+            if !drafts.openAIApiKey.isEmpty || !drafts.azureClientSecret.isEmpty || !drafts.azureApiKey.isEmpty {
                 let model = CleanupSettingsModel(access: .live, drafts: drafts)
                 model.reload()
                 if !drafts.openAIApiKey.isEmpty {
@@ -220,6 +307,10 @@ extension SettingsDrafts {
                 }
                 if !drafts.azureClientSecret.isEmpty {
                     model.saveAzureClientSecret()
+                    if let error = model.errorMessage { throw SettingsDraftSaveError(error) }
+                }
+                if !drafts.azureApiKey.isEmpty {
+                    model.saveAzureApiKey()
                     if let error = model.errorMessage { throw SettingsDraftSaveError(error) }
                 }
             }
@@ -240,6 +331,23 @@ extension SettingsDrafts {
                     drafts.wordPackWorkspace = LibraryWorkspace(catalog: catalog)
                 }
                 onChanged()
+            }
+            drafts.indicator?.save()
+            if saveCleanupPrompts {
+                cleanupSettings.writingStyle = CleanupPrompt.storedOverride(
+                    cleanupWritingStyle, defaultValue: CleanupPrompt.defaultWritingStyle)
+                cleanupSettings.frontierPrompt = CleanupPrompt.storedOverride(
+                    cleanupFrontierPrompt, defaultValue: CleanupPrompt.defaultFrontierPrompt)
+                cleanupSettings.localPrompt = CleanupPrompt.storedOverride(
+                    cleanupLocalPrompt, defaultValue: CleanupPrompt.defaultLocalPrompt)
+                drafts.markCleanupPromptsSaved(
+                    writingStyle: cleanupWritingStyle,
+                    frontierPrompt: cleanupFrontierPrompt,
+                    localPrompt: cleanupLocalPrompt)
+            }
+            if saveCleanupIdleTime {
+                cleanupSettings.localModelIdleMinutes = cleanupIdleMinutes
+                drafts.savedCleanupIdleMinutes = cleanupIdleMinutes
             }
         }
     }

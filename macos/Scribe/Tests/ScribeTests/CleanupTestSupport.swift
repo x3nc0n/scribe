@@ -376,20 +376,24 @@ struct CleanupStoreFixture {
     let store: CleanupSettingsStore
     let defaults: UserDefaults
     let apiKeys: InMemorySecretStore
+    let azureApiKeys: InMemorySecretStore
     let clientSecrets: InMemorySecretStore
 }
 
 extension XCTestCase {
     func makeCleanupStore(
         apiKeys: InMemorySecretStore = InMemorySecretStore(),
-        clientSecrets: InMemorySecretStore = InMemorySecretStore()
+        clientSecrets: InMemorySecretStore = InMemorySecretStore(),
+        azureApiKeys: InMemorySecretStore = InMemorySecretStore()
     ) -> CleanupStoreFixture {
         let isolated = makeIsolatedDefaults(label: "cleanup")
         return CleanupStoreFixture(
             store: CleanupSettingsStore(
-                domain: .suite(isolated.suiteName), apiKeys: apiKeys, clientSecrets: clientSecrets),
+                domain: .suite(isolated.suiteName), apiKeys: apiKeys, clientSecrets: clientSecrets,
+                azureApiKeys: azureApiKeys),
             defaults: isolated.defaults,
             apiKeys: apiKeys,
+            azureApiKeys: azureApiKeys,
             clientSecrets: clientSecrets)
     }
 
@@ -702,7 +706,10 @@ extension CleanupProviderFactory {
                 await LocalServerClient(session: session).read(endpoint, apiKey: apiKey)
             },
             now: clock.now,
-            monotonicNow: clock.monotonicNow)
+            monotonicNow: clock.monotonicNow,
+            localModelLifecycle: LocalModelLifecycle(
+                idle: .zero,
+                actions: .init(unloadModel: { _, _, _ in true }, unloadInstance: { _, _, _ in true })))
     }
 }
 

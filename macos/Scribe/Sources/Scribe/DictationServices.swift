@@ -57,9 +57,17 @@ protocol DictationCleaning {
 
     /// Drops the cached provider and credential (`CleanupProviderCache.invalidate()`).
     func invalidate()
+
+    /// Frees the local model for `reason` once no use is in flight (pause, shutdown). Never throws; a model another
+    /// app holds is left alone unless the reason frees it explicitly.
+    func releaseLocalModel(_ reason: LocalModelReleaseReason) async
+    func notePause(_ paused: Bool)
 }
 
 extension DictationCleaning {
+    func releaseLocalModel(_ reason: LocalModelReleaseReason) async {}
+    func notePause(_ paused: Bool) {}
+
     func prepareLocalModel(
         isCurrent: @escaping @MainActor @Sendable () async -> Bool,
         onStarting: @escaping @MainActor @Sendable () async -> Void
@@ -241,6 +249,14 @@ struct LiveDictationCleanup: DictationCleaning {
 
     func invalidate() {
         cache.invalidate()
+    }
+
+    func releaseLocalModel(_ reason: LocalModelReleaseReason) async {
+        await cache.releaseLocalModel(reason)
+    }
+
+    func notePause(_ paused: Bool) {
+        cache.lifecycle.notePause(paused)
     }
 }
 

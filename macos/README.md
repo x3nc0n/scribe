@@ -4,9 +4,10 @@ A native Swift menu bar port of [Scribe](../README.md), Windows' offline push-to
 app. Built with Swift Package Manager and bundled into a minimal, locally self-signed `.app` by a shell
 script. Feature parity with the Windows app is close (see `PORTING-PLAN.md` for the parity table, the
 row-by-row checklist and known gaps). The current code passes CI's builds, unit and scenario tests and
-sanitizer runs on macOS 15 and 26, but it has not yet been run on a real Mac: permissions, the
-microphone, the push-to-talk key, insertion into real apps and the overlay still need that check (see
-Tests below).
+sanitizer runs on macOS 15 and 26, with native Intel build/test/package coverage too. Right Option recording
+and direct keyboard insertion have been exercised on an Apple Silicon Mac, including Teams. This is not a
+complete interactive acceptance pass: full-screen presentation, alternative speech models and the remaining
+permission/device combinations still need checks (see Tests below).
 
 ## Requirements
 
@@ -39,8 +40,8 @@ certificate, rebuild and re-grant the permissions once for the new certificate.
 
 ## Releasing
 
-Scribe for macOS ships as a notarized direct download through GitHub Releases, not through the Mac App Store, because
-App Sandbox blocks the cross-app Accessibility text injection Scribe needs.
+The release pipeline targets a notarized direct download through GitHub Releases, not the Mac App Store.
+Developer ID signing and notarization still need an end-to-end credentialed release verification.
 
 One-time setup:
 
@@ -93,6 +94,8 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
 - Menu bar app shell (`NSStatusItem`, background-only via `LSUIElement`) with tray items for test
   dictation, Settings, AI Cleanup/Pause toggles, Recent Dictations, Quick Add to Dictionary,
   Welcome, and Quit
+- A Microphone submenu refreshes available devices when opened, preserves an unavailable saved choice and links to
+  Sound settings.
 - Global push-to-talk hotkey, real audio capture, and text injection into the app that had focus when the
   recording started. Scribe types Unicode keyboard events directly, matching Windows' default, without
   changing your clipboard or writing the editor's Accessibility text attributes. Accessibility permission
@@ -118,7 +121,11 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
   it
 - On-device ASR via Foundry Local's `parakeet-tdt-0.6b-v2`, an English model (`TranscriptionEngine.swift`).
   The recognizer runs off the main thread with a deadline and can be cancelled, and the recording it
-  reads is a private temporary file that is deleted as soon as it returns
+  reads is a private temporary file that is deleted as soon as it returns. Long Foundry recordings decode sequentially
+  in chunks of at most 30 seconds, with jointly planned quiet seams. Advanced discovers the installed speech-model
+  catalog and offers model selection and explicit downloads; cancellation or quit stops and reaps a download.
+- AI cleanup supports staged editing of the global writing style and local/detailed guardrails with restore-default
+  actions. Microsoft Foundry also accepts a Keychain-backed resource API key, which takes precedence over Entra sign-in.
 - Capture that belongs to one recording at a time: every input channel is mixed in, so a microphone on
   any input of an interface is heard; a device change ends the recording and keeps what it captured;
   Right Option (the default key) is held while you talk and never stops on silence. Caps Lock is still available as
@@ -166,9 +173,8 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
   dictionary/snippet/profile row actions, stay immediate and are not rolled back by Discard.
   `SettingsWindowController.prepareForApplicationTermination()` reuses the same decisions for quit
   or restart, waits for pending saves/adds, shares an already-open close prompt, and returns false
-  on Keep editing, save failure or newer edits. It leaves Settings editable on refusal. The lifecycle
-  owner must await it before starting shutdown or scheduling a restart; this branch deliberately does
-  not wire AppDelegate, so application-wide protection is not complete until that hook is integrated.
+  on Keep editing, save failure or newer edits. It leaves Settings editable on refusal.
+  `AppDelegate.applicationShouldTerminate` awaits that decision before starting shutdown.
 - History shows the newest 200 stored dictations, with copy and confirmed per-item delete. Search
   runs asynchronously against every stored dictation's text and recorded app identity before limiting
   the displayed matches to 200, with a visible "first 200 matches, newest first" disclosure.
@@ -189,6 +195,18 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
   context size; only a missing or differently sized model gets a fixed local readying request. It contains no dictated
   text or vocabulary, has a bounded wait, and a failure leaves dictation text intact while cleanup is skipped. Cleanup
   failure notifications use plain language and are suppressed until cleanup recovers or its configuration changes.
+- `LocalModelLifecycle` coordinates Ollama and LM Studio releases on pause, cleanup off, a provider or model change and
+  Free memory, and retires Scribe-loaded LM Studio copies at shutdown.
+  Every release waits for readiness, cleanup and Test connection uses in flight (bounded, cancellable), LM Studio copies
+  Scribe loaded are tracked and retired by instance id, and a failed unload stays owed. AI cleanup stages the idle time
+  for Ollama and LM Studio (10 minutes by default, Never supported); Save applies it, Cancel discards it. A shorter
+  countdown uses the end of the last use, not the time the setting changed. New requests wait for a model resize or
+  unload already in progress. Foundry Local cleanup and speech-memory release remain open work. Test connection waits
+  180 s for a recognized local app (Ollama, LM Studio), 90 s for other custom endpoints.
+- Dictionary's **Suggest with AI** asks before sending a bounded raw sample from the latest Try dictation report and
+  suggestion instructions. It never reads saved history or sends expanded snippets/templates. Consent is tied to the
+  saved cleanup configuration's revision: changing away and back still requires consent again. Every request/retry
+  shares the settings/send admission boundary, and a stale reply is discarded. Only reviewed, selected words are added.
 - Diagnostics (P50/P95 decode latency, real-time factor) and Usage Insights (totals, trend chart,
   top apps, recurring terms with one-click dictionary add, and an opt-in AI summary that sends only your
   totals and the recurring terms that are dictionary spellings: never a word mined from your dictations,
@@ -267,15 +285,17 @@ swift format lint --strict --recursive --configuration macos/Scribe/.swift-forma
 
 ## Known gaps vs. Windows
 
-See `PORTING-PLAN.md` for the parity table and the authoritative, row-by-row feature checklist. As of this writing
-the main outstanding gaps are: the default speech model is English-only; long recordings are transcribed in one
-call rather than split on pauses as Windows does; there is no voice activity detection trimming the capture before
-recognition; the Settings page structure, Find a setting and the Word packs editor now match Windows; automatic
-readiness for Ollama and LM Studio, including the "Starting local model" state, is now ported, but the full idle and
-pause memory-release policy for those models is not; and there is no
-auto-update story yet. Dev
-builds use a local self-signed certificate, and public releases use the Developer ID pipeline documented above. Since
-Windows 0.4.3 the port has gained the space after each dictation, the new recording indicator, Ollama and LM Studio
-under "On this PC", the mentioned-terms glossary disclosed in Settings, context size, the Chat Completions or
-Responses choice for another AI service, and the full word packs editor; see "Windows 0.4.4 to 0.5.4 parity pass" in
-`PORTING-PLAN.md`.
+See `PORTING-PLAN.md`, "Remaining parity gaps, checked against current source", for evidence, the smallest
+implementation surface and any dependency, runtime or credential blocker. Confirmed gaps include VAD trimming,
+multilingual and bundled ASR, chunking long recordings, GitHub Copilot cleanup,
+automatic updates, Intel validation, and full real-ASR scenario coverage. Settings also lacks a separate indicator
+preview and visibility toggle, global writing-style and advanced-prompt editing, Azure resource API-key auth, and
+speech-model/thread controls, an editable idle memory-release duration, and a tray microphone picker. Mouse-button
+shortcuts are not implemented; confirm that product-scope decision before treating them as platform-inapplicable.
+Shortcut input is one key, with Caps Lock as the only toggle, and is deliberately listen-only. Idle and pause release
+for local cleanup models remains incomplete.
+
+The macOS port deliberately keeps its distinct cleanup pipeline and privacy choices; those differences are documented
+separately and are not treated as missing features. The separate parity table also distinguishes those choices from
+stale historical rows. Build signing and release notarization still need real Developer ID credentials for
+end-to-end verification.

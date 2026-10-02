@@ -11,11 +11,18 @@ final class SettingsSearchIndexTests: XCTestCase {
         assertSearch("silence", contains: "Stop when I stop talking", on: .dictation)
         assertSearch("overlay", contains: "Show the recording indicator", on: .dictation)
         assertSearch("pill", contains: "Show the recording indicator", on: .dictation)
+        assertSearch("hide indicator", contains: "Show the recording indicator", on: .dictation)
+        assertSearch("preview", contains: "Preview on screen", on: .dictation)
         assertSearch("library", contains: "Word packs", on: .dictionary)
         assertSearch("libraries", contains: "Word packs", on: .dictionary)
         assertSearch("vocabulary", contains: "Word packs", on: .dictionary)
         assertSearch("playground", contains: "Try dictation", on: .tryDictation)
         assertSearch("model", contains: "Model alias", on: .aiCleanup)
+        assertSearch("writing style", contains: "Writing style", on: .aiCleanup)
+        assertSearch("local guardrail prompt", contains: "Local guardrail prompt", on: .aiCleanup)
+        assertSearch("detailed prompt", contains: "Detailed guardrail prompt", on: .aiCleanup)
+        assertSearch("restore default", contains: "Restore default guardrail prompts", on: .aiCleanup)
+        assertSearch("Foundry API key", contains: "Microsoft Foundry API key", on: .aiCleanup)
         assertSearch("startup", contains: "Start Scribe when you log in", on: .dictation)
         assertSearch("boot", contains: "Start Scribe when you log in", on: .dictation)
         assertSearch("input monitoring", contains: "Input Monitoring access", on: .dictation)
@@ -64,6 +71,7 @@ final class SettingsSearchIndexTests: XCTestCase {
         assertRequirements(
             "ai.local.ollama.context", ["checkbox:ai.enabled", "radio:ai.provider", "radio:ai.local.ollama"])
         assertRequirements("ai.azure.sp.secret", ["checkbox:ai.enabled", "radio:ai.provider", "radio:ai.azure.auth"])
+        assertRequirements("ai.azure.api-key", ["checkbox:ai.enabled", "radio:ai.provider"])
         assertRequirements("ai.custom.model", ["checkbox:ai.enabled", "radio:ai.provider"])
     }
 

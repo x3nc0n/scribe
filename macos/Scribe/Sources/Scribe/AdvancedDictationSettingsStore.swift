@@ -3,6 +3,7 @@ import Foundation
 /// Settings from the Advanced page that affect dictation before any app profile override.
 struct AdvancedDictationSettingsStore {
     private static let newlineModeDefaultsKey = "ScribeNewlineMode"
+    private static let speechModelAliasDefaultsKey = "ScribeSpeechModelAlias"
 
     static var live: AdvancedDictationSettingsStore {
         AdvancedDictationSettingsStore(defaults: .standard)
@@ -25,6 +26,17 @@ struct AdvancedDictationSettingsStore {
         }
         nonmutating set {
             defaults.set(newValue.rawValue, forKey: Self.newlineModeDefaultsKey)
+        }
+    }
+
+    var speechModelAlias: String {
+        get {
+            defaults.string(forKey: Self.speechModelAliasDefaultsKey).flatMap { $0.isEmpty ? nil : $0 }
+                ?? TranscriptionBackendResolver.defaultFoundryModelAlias
+        }
+        nonmutating set {
+            guard !newValue.isEmpty, !newValue.utf8.contains(0) else { return }
+            defaults.set(newValue, forKey: Self.speechModelAliasDefaultsKey)
         }
     }
 }

@@ -357,6 +357,7 @@ private struct SnapshotSettingsShell: View {
         switch selection {
         case .dictation:
             SettingsDictationPage(
+                drafts: dependencies.drafts,
                 overlayPanelController: dependencies.overlayPanelController,
                 hotkeyStore: HotkeySettingsStore(defaults: dependencies.defaults),
                 audioDeviceStore: AudioDeviceStore(defaults: dependencies.defaults),
@@ -381,7 +382,8 @@ private struct SnapshotSettingsShell: View {
                 persistenceStore: dependencies.persistenceStore,
                 dictionaryLibraryService: dependencies.dictionaryLibraryService,
                 onChanged: {},
-                drafts: dependencies.drafts)
+                drafts: dependencies.drafts,
+                pipelineReportStore: dependencies.pipelineReportStore)
         case .voiceSnippets:
             SettingsVoiceSnippetsPage(
                 persistenceStore: dependencies.persistenceStore,

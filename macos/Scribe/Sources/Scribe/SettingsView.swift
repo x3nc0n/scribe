@@ -162,6 +162,7 @@ struct SettingsView: View {
         }
         .frame(minWidth: 860, minHeight: 600)
         .onAppear {
+            drafts.configureIndicator(controller: overlayPanelController)
             drafts.configureSave(
                 store: persistenceStore,
                 libraries: dictionaryLibraryService,
@@ -218,6 +219,7 @@ struct SettingsView: View {
         switch drafts.section ?? .dictation {
         case .dictation:
             SettingsDictationPage(
+                drafts: drafts,
                 overlayPanelController: overlayPanelController,
                 hotkeyStore: hotkeyStore,
                 audioDeviceStore: audioDeviceStore,
@@ -236,7 +238,8 @@ struct SettingsView: View {
                 dictionaryLibraryService: dictionaryLibraryService,
                 onChanged: onProfilesOrRulesChanged,
                 drafts: drafts,
-                requestedTab: dictionarySearchTab)
+                requestedTab: dictionarySearchTab,
+                pipelineReportStore: pipelineReportStore)
         case .voiceSnippets:
             SettingsVoiceSnippetsPage(
                 persistenceStore: persistenceStore,

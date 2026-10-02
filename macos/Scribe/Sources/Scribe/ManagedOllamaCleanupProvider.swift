@@ -21,6 +21,8 @@ final class ManagedOllamaCleanupProvider: CleanupProvider {
     let completionsURL: URL
     private let keepAliveMinutes: Int
     private let localModelLane: AsyncLane
+    private let lifecycle: LocalModelLifecycle
+    private let lifecycleEndpoint: String
     private let timeout: TimeInterval
     private let transport: ChatCompletionsTransport
     private let readLocalServer: @Sendable (String) async -> LocalServerState
@@ -30,6 +32,7 @@ final class ManagedOllamaCleanupProvider: CleanupProvider {
         baseURL: URL = ManagedOllamaCleanupProvider.defaultBaseURL,
         keepAliveMinutes: Int = LocalModelDefaults.keepAliveMinutes,
         localModelLane: AsyncLane = LocalModelDefaults.sharedLane,
+        lifecycle: LocalModelLifecycle? = nil,
         timeout: TimeInterval = 30,
         readLocalServer: @escaping @Sendable (String) async -> LocalServerState = { endpoint in
             await LocalServerClient().read(endpoint)
@@ -42,12 +45,26 @@ final class ManagedOllamaCleanupProvider: CleanupProvider {
             ?? baseURL.appendingPathComponent("v1/chat/completions")
         self.keepAliveMinutes = keepAliveMinutes
         self.localModelLane = localModelLane
+        self.lifecycle = lifecycle ?? LocalModelLifecycle(idle: .zero, actions: .connected(to: session))
+        self.lifecycleEndpoint = baseURL.absoluteString
         self.timeout = timeout
         self.transport = ChatCompletionsTransport(session: session)
         self.readLocalServer = readLocalServer
     }
 
+    private func beginLease() async throws -> LocalModelLifecycle.Lease {
+        do {
+            return try await lifecycle.beginUse(
+                LocalModelTarget(
+                    endpoint: lifecycleEndpoint, model: model, app: .ollama, apiKey: nil))
+        } catch is LocalModelLifecycleError {
+            throw CleanupProviderError.timedOut
+        }
+    }
+
     func clean(_ request: CleanupRequest) async throws -> CleanupResponse {
+        let lease = try await beginLease()
+        defer { lease.end() }
         let completion = try await localModelLane.run {
             try await transport.complete(
                 request,
@@ -69,7 +86,9 @@ final class ManagedOllamaCleanupProvider: CleanupProvider {
         isCurrent: @escaping @MainActor @Sendable () async -> Bool,
         onStarting: @escaping @MainActor @Sendable () async -> Void
     ) async throws -> LocalModelPreparationResult {
-        try await localModelLane.run {
+        let lease = try await beginLease()
+        defer { lease.end() }
+        return try await localModelLane.run {
             try await LocalModelReadiness.prepare(
                 isResident: {
                     let state = await self.readLocalServer(Self.defaultBaseURL.absoluteString)

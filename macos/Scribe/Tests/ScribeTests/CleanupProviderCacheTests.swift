@@ -5,6 +5,61 @@ import os
 @testable import Scribe
 
 final class CleanupProviderCacheTests: XCTestCase {
+    func testChangingIdleTimeRebuildsTheRetentionSentByTheProvider() async throws {
+        let rig = try makeRig()
+        rig.store.providerKind = .ollama
+        let request = CleanupRequest(transcript: "sample")
+        _ = try await rig.cache.provider().clean(request)
+        XCTAssertEqual(rig.requests.all.last?.jsonBody["keep_alive"] as? String, "10m")
+        rig.store.localModelIdleMinutes = 30
+        _ = try await rig.cache.provider().clean(request)
+        XCTAssertEqual(rig.requests.all.last?.jsonBody["keep_alive"] as? String, "30m")
+        rig.store.localModelIdleMinutes = 0
+        _ = try await rig.cache.provider().clean(request)
+        XCTAssertNil(rig.requests.all.last?.jsonBody["keep_alive"])
+    }
+
+    func testOneOffAdmissionRefusesAConfigurationThatChangedBack() async throws {
+        let rig = try makeRig()
+        configureOpenAICompatible(rig.store)
+        rig.store.isEnabled = true
+        let admission = try rig.cache.admitOneOff()
+        let model = rig.store.openAIModel
+        rig.store.openAIModel = "other"
+        rig.store.openAIModel = model
+        do {
+            _ = try await rig.cache.completeOneOff(
+                CleanupRequest(transcript: "private sample", writingStylePrompt: "instructions"),
+                admission: admission)
+            XCTFail("the admission must not survive a configuration change")
+        } catch {
+            XCTAssertEqual(error as? CleanupSendHandoff.Refusal, .settingsChanged)
+        }
+        XCTAssertEqual(rig.requests.count, 0)
+    }
+
+    func testOneOffDropsTheReplyWhenSettingsChangeAfterHandoff() async throws {
+        let fixture = makeCleanupStore()
+        fixture.store.isEnabled = true
+        configureOpenAICompatible(fixture.store)
+        let store = fixture.store
+        let session = makeStubSession { request in
+            store.isEnabled = false
+            return StubReply.completion(request, "stale reply")
+        }
+        let factory = CleanupProviderFactory.testing(session: session)
+        let cache = CleanupProviderCache(store: fixture.store, environment: [:], factory: factory)
+        let admission = try cache.admitOneOff()
+        do {
+            _ = try await cache.completeOneOff(
+                CleanupRequest(transcript: "private sample", writingStylePrompt: "instructions"),
+                admission: admission)
+            XCTFail("a stale reply must not be presented")
+        } catch {
+            XCTAssertEqual(error as? CleanupSendHandoff.Refusal, .settingsChanged)
+        }
+    }
+
     private struct Rig {
         let fixture: CleanupStoreFixture
         let cache: CleanupProviderCache
@@ -61,7 +116,9 @@ final class CleanupProviderCacheTests: XCTestCase {
         let timer: @Sendable (Duration) async throws -> Void = checkTimer ?? realTimer
         let cache = CleanupProviderCache(
             store: fixture.store, environment: environment, factory: factory,
-            checkDeadline: { kind in checkDeadline ?? CleanupProviderCache.checkDeadline(for: kind) },
+            checkDeadline: { kind, local in
+                checkDeadline ?? CleanupProviderCache.checkDeadline(for: kind, localApp: local)
+            },
             checkTimer: timer, readinessTimer: readinessTimer ?? realTimer)
         return Rig(
             fixture: fixture, cache: cache, requests: requests, azureCli: azureCli, foundryStatus: fakeFoundryStatus,
@@ -372,6 +429,46 @@ final class CleanupProviderCacheTests: XCTestCase {
         XCTAssertEqual(rig.fixture.apiKeys.reads, 1, "the dictation reused the provider Test Connection built")
     }
 
+    @MainActor
+    func testTestConnectionUsesUnsavedFoundryCredentialsAndPromptDrafts() async throws {
+        let rig = try makeRig()
+        var settings = CleanupSettingsAccess.backed(by: rig.store, providers: rig.cache).load()
+        settings.isEnabled = true
+        settings.providerKind = .microsoftFoundry
+        settings.azureEndpoint = "https://my-res.services.ai.azure.com/api/projects/my-project"
+        settings.azureDeployment = "gpt-5-mini"
+        settings.azureAuthMode = .servicePrincipal
+        settings.azureApiKeySelected = true
+        settings.azureTenantId = ""
+        settings.azureClientId = ""
+        let key = "unsaved-foundry-key"
+        let writingStyle = "Use the candidate style."
+        let detailedPrompt = "Candidate detailed guardrails."
+        let localPrompt = "Candidate local guardrails."
+        let candidate = CleanupConnectionCandidate(
+            settings: settings,
+            openAIApiKey: nil,
+            azureClientSecret: nil,
+            azureApiKey: key,
+            writingStyle: writingStyle,
+            frontierPrompt: detailedPrompt,
+            localPrompt: localPrompt)
+
+        let check = await rig.cache.checkConnection(candidate: candidate)
+
+        XCTAssertTrue(check.reachable, check.message)
+        let request = try XCTUnwrap(rig.requests.all.first)
+        XCTAssertEqual(request.header("api-key"), key)
+        XCTAssertNil(request.header("Authorization"))
+        XCTAssertEqual(
+            request.messageContents,
+            [detailedPrompt + "\n\nWriting style:\n" + writingStyle, "<transcript>\nok\n</transcript>"])
+        XCTAssertEqual(rig.azureCli.launches, 0)
+        XCTAssertEqual(rig.fixture.azureApiKeys.writes, 0)
+        XCTAssertFalse(
+            rig.fixture.defaults.dictionaryRepresentation().values.contains { ($0 as? String) == key })
+    }
+
     func testTestConnectionReportsADeploymentThatCannotClean() async throws {
         let rig = try makeRig { request in
             StubReply.json(
@@ -402,6 +499,27 @@ final class CleanupProviderCacheTests: XCTestCase {
         XCTAssertFalse(check.reachable)
         XCTAssertEqual(check.message, CleanupConfigurationProblem.openAIEndpointMissing.message(for: .settings))
         XCTAssertEqual(rig.requests.count, 0)
+    }
+
+    func testTestConnectionDeadlineFollowsTheRecognizedLocalTarget() {
+        XCTAssertEqual(CleanupProviderCache.checkDeadline(for: .openAICompatible, localApp: true), .seconds(180))
+        XCTAssertEqual(CleanupProviderCache.checkDeadline(for: .openAICompatible, localApp: false), .seconds(90))
+        XCTAssertEqual(CleanupProviderCache.checkDeadline(for: .microsoftFoundry, localApp: false), .seconds(90))
+        XCTAssertEqual(CleanupProviderCache.checkDeadline(for: .ollama, localApp: false), .seconds(180))
+    }
+
+    @MainActor
+    func testLMStudioTestConnectionWaitsOutTheLocalDeadlineAndARemoteEndpointDoesNot() async throws {
+        let waits = DurationLog()
+        let rig = try makeRig(checkTimer: { try await waits.add($0) })
+        configureOpenAICompatible(rig.store)
+        rig.store.isEnabled = true
+        _ = await rig.cache.checkConnection()
+        rig.store.openAIBaseURL = "https://api.example.com/v1"
+        rig.store.selectedLocalApp = .none
+        _ = await rig.cache.checkConnection()
+        XCTAssertEqual(waits.values.first, .seconds(180))
+        XCTAssertEqual(waits.values.last, .seconds(90))
     }
 
     func testTestConnectionGivesOnDeviceModelsTimeToLoad() {
@@ -968,5 +1086,15 @@ final class CleanupProviderCacheTests: XCTestCase {
         XCTAssertEqual(result, .cancelled)
         XCTAssertTrue(read.sawCancellation)
         XCTAssertEqual(rig.requests.count, 0)
+    }
+}
+
+private final class DurationLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [Duration] = []
+    var values: [Duration] { lock.withLock { stored } }
+    func add(_ value: Duration) async throws {
+        lock.withLock { stored.append(value) }
+        try await Task.sleep(for: .seconds(3600))
     }
 }

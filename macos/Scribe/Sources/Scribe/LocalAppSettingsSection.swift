@@ -55,10 +55,14 @@ final class LocalAppSettingsModel: ObservableObject {
     @Published private var states: [LocalServerApp: LocalServerState] = [:]
     @Published private var loading: Set<LocalServerApp> = []
 
-    private let client: LocalServerClient
+    @Published private(set) var freeMemoryNotice: String?
 
-    init(client: LocalServerClient = LocalServerClient()) {
+    private let client: LocalServerClient
+    private let lifecycle: LocalModelLifecycle
+
+    init(client: LocalServerClient = LocalServerClient(), lifecycle: LocalModelLifecycle = .shared) {
         self.client = client
+        self.lifecycle = lifecycle
     }
 
     func state(for app: LocalServerApp) -> LocalServerState? {
@@ -81,12 +85,16 @@ final class LocalAppSettingsModel: ObservableObject {
         guard app != .none, let endpoint else {
             return
         }
-        do {
-            _ = try await LocalModelDefaults.sharedLane.run {
-                await client.unload(endpoint, modelID: model)
-            }
-        } catch {
-            ScribeLog.warning(.cleanup, "Could not free the local model", .failure(error))
+        let target = LocalModelTarget(endpoint: endpoint, model: model, app: app, apiKey: nil)
+        let outcome = await lifecycle.release(.freeMemory, target: target)
+        switch outcome {
+        case .released, .nothingToRelease:
+            freeMemoryNotice = nil
+        case .drainTimedOut:
+            freeMemoryNotice = "The model is still in use. Try again in a moment."
+        default:
+            freeMemoryNotice = "Could not free the model."
+            ScribeLog.warning(.cleanup, "Could not free the local model", .name("outcome", outcome))
         }
         await refresh(for: app, endpoint: endpoint)
     }
@@ -97,8 +105,6 @@ struct CleanupProviderSettingsSection: View {
     @ObservedObject var drafts: SettingsDrafts
     @StateObject private var local = LocalAppSettingsModel()
     @StateObject private var vocabularyStatus: CleanupVocabularyStatusModel
-
-    private let defaultIdleMinutes = LocalModelDefaults.keepAliveMinutes
 
     init(
         model: CleanupSettingsModel,
@@ -197,9 +203,19 @@ struct CleanupProviderSettingsSection: View {
         let selectedModel = model.localModel(for: choice)
         let state = local.state(for: app)
         let choices = LocalAppSetup.modelChoices(state?.models ?? [], selectedModel)
-        let status = LocalAppSetup.describe(app, state, choices.selected, idleMinutes: defaultIdleMinutes)
+        let status = LocalAppSetup.describe(
+            app, state, choices.selected, idleMinutes: CleanupSettingsStore.live.localModelIdleMinutes)
         let askedContext = model.localContextTokens(for: choice)
         let effectiveContext = state?.loaded(for: choices.selected)?.contextTokens ?? 0
+        Picker("Free local model memory after", selection: $drafts.cleanupIdleMinutes) {
+            ForEach(Array(Set([0, 1, 2, 5, 10, 15, 30, 60, drafts.cleanupIdleMinutes])).sorted(), id: \.self) {
+                minutes in
+                Text(minutes == 0 ? "Never" : "\(minutes) minutes").tag(minutes)
+            }
+        }
+        Text("Applies to Ollama and LM Studio. Save applies the change; the speech recognizer manages its own memory.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         Picker(
             "Model",
             selection: Binding(
@@ -263,6 +279,9 @@ struct CleanupProviderSettingsSection: View {
                 .disabled(!action.isEnabled)
                 Spacer()
             }
+        }
+        if let notice = local.freeMemoryNotice {
+            Text(notice).font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -331,12 +350,34 @@ struct CleanupProviderSettingsSection: View {
             )
             .font(.caption)
             .foregroundStyle(.secondary)
-            Picker("Authentication", selection: $model.values.azureAuthMode) {
-                Text("Azure CLI (az login)").tag(AzureAuthMode.azureCli)
-                Text("Service principal").tag(AzureAuthMode.servicePrincipal)
+            Picker(
+                "Authentication",
+                selection: Binding(
+                    get: { model.azureAuthenticationSelection },
+                    set: { model.setAzureAuthenticationSelection($0) })
+            ) {
+                ForEach(AzureAuthenticationSelection.allCases) { selection in
+                    Text(selection.label).tag(selection)
+                }
             }
 
-            if model.values.azureAuthMode == .servicePrincipal {
+            if model.azureAuthenticationSelection == .apiKey {
+                SecureField(
+                    model.hasSavedAzureApiKey ? "API key saved (leave blank to keep)" : "API key",
+                    text: $drafts.azureApiKey)
+                HStack {
+                    Button("Save API Key") { model.saveAzureApiKey() }
+                        .disabled(!model.canSaveAzureApiKey)
+                    if model.hasSavedAzureApiKey {
+                        Button("Clear API Key", role: .destructive) { model.clearAzureApiKey() }
+                    }
+                }
+                Text(
+                    "The API key is stored only in Keychain. When selected, it takes precedence over Azure CLI or service principal sign-in. Save it before testing the connection."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else if model.azureAuthenticationSelection == .servicePrincipal {
                 TextField("Tenant ID", text: $model.values.azureTenantId)
                 TextField("Client ID", text: $model.values.azureClientId)
                 SecureField(

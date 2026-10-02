@@ -82,7 +82,7 @@ extension CleanupPrompt {
     /// single-line contract added when the target needs it. Windows' `ResolveWritingStyleOverride`.
     static func writingStyle(profileStyle: String?, requireSingleLine: Bool) -> String {
         let trimmed = profileStyle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let style = trimmed.isEmpty ? defaultWritingStyle : trimmed
+        let style = trimmed.isEmpty ? CleanupPrompt.effectiveWritingStyle : trimmed
         return requireSingleLine ? style + " " + singleLineWritingStyle : style
     }
 }
@@ -387,10 +387,14 @@ final class DictationController {
     func setPaused(_ paused: Bool) {
         guard paused != isPaused else { return }
         isPaused = paused
+        services.cleanup.notePause(paused)
         if paused {
             ScribeLog.info(.dictation, "Dictation paused")
         } else {
             ScribeLog.info(.dictation, "Dictation resumed")
+        }
+        if paused {
+            Task { await services.cleanup.releaseLocalModel(.pause) }
         }
         if paused, let current = recording {
             endRecording(current.id, reason: .paused)
@@ -1415,6 +1419,7 @@ final class DictationController {
         _ = await discardedSeal?.value
         await services.capture.waitUntilIdle()
 
+        await services.cleanup.releaseLocalModel(.shutdown)
         shutdownProgress = .drainingHistory
         let history = services.history
         let timeout = configuration.historyDrainTimeout

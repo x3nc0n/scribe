@@ -21,6 +21,7 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
     private let loadLocalContext: @Sendable (_ endpoint: String, _ model: String, _ contextTokens: Int) async -> String?
     private let timeout: TimeInterval
     private let transport: ChatCompletionsTransport
+    private let lifecycle: LocalModelLifecycle
     private let plainRequests = OSAllocatedUnfairLock(initialState: false)
 
     init(
@@ -34,6 +35,7 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
         localServerApp: LocalServerApp = .none,
         keepAliveMinutes: Int = LocalModelDefaults.keepAliveMinutes,
         localModelLane: AsyncLane = LocalModelDefaults.sharedLane,
+        lifecycle: LocalModelLifecycle? = nil,
         localTuning: @escaping @Sendable () -> LocalModelTuning = { .none },
         loadLocalContext:
             @escaping @Sendable (
@@ -64,6 +66,7 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
         self.localServerApp = localServerApp
         self.keepAliveMinutes = keepAliveMinutes
         self.localModelLane = localModelLane
+        self.lifecycle = lifecycle ?? LocalModelLifecycle(idle: .zero, actions: .connected(to: session))
         self.localTuning = localTuning
         self.localServerEndpoint = self.serviceURL.absoluteString
         self.loadLocalContext = loadLocalContext
@@ -72,7 +75,25 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
         self.transport = ChatCompletionsTransport(session: session)
     }
 
+    private var lifecycleTarget: LocalModelTarget? {
+        guard localServerApp != .none, let endpoint = localServerEndpoint else { return nil }
+        return LocalModelTarget(endpoint: endpoint, model: model, app: localServerApp, apiKey: apiKey)
+    }
+
+    /// Every use of a model on this Mac, a dictation's cleanup, Test connection and one-off requests included, holds a
+    /// lease for its whole length, so no release unloads the model under it.
+    private func beginLease() async throws -> LocalModelLifecycle.Lease? {
+        guard let target = lifecycleTarget else { return nil }
+        do {
+            return try await lifecycle.beginUse(target)
+        } catch is LocalModelLifecycleError {
+            throw CleanupProviderError.timedOut
+        }
+    }
+
     func clean(_ request: CleanupRequest) async throws -> CleanupResponse {
+        let lease = try await beginLease()
+        defer { lease?.end() }
         let local = usesLocalCleanupPrompt
         let plain = local && plainRequests.withLock { $0 }
 
@@ -80,7 +101,8 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
             let completion = try await complete(
                 request,
                 plain: plain,
-                local: local)
+                local: local,
+                lease: lease)
             return CleanupResponse(
                 cleanedText: completion.text, latency: completion.latency, providerID: id, modelID: model)
         } catch let error as CleanupProviderError {
@@ -93,7 +115,8 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
                 let completion = try await complete(
                     request,
                     plain: true,
-                    local: local)
+                    local: local,
+                    lease: lease)
                 return CleanupResponse(
                     cleanedText: completion.text, latency: completion.latency, providerID: id, modelID: model)
             } catch {
@@ -109,6 +132,8 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
     ) async throws -> LocalModelPreparationResult {
         guard localServerApp != .none, let endpoint = localServerEndpoint else { return .notApplicable }
         let requestedContext = ContextBudget.sanitize(localTuning().contextTokens)
+        let lease = try await beginLease()
+        defer { lease?.end() }
         return try await localModelLane.run {
             try await LocalModelReadiness.prepare(
                 isResident: {
@@ -124,7 +149,8 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
                         LocalModelReadiness.request,
                         plain: false,
                         local: true,
-                        acquireLane: false)
+                        acquireLane: false,
+                        lease: lease)
                 })
         }
     }
@@ -133,7 +159,8 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
         _ request: CleanupRequest,
         plain: Bool,
         local: Bool,
-        acquireLane: Bool = true
+        acquireLane: Bool = true,
+        lease: LocalModelLifecycle.Lease? = nil
     ) async throws -> ChatCompletionsTransport.Completion {
         let tuning = localTuning()
         let keepAlive = localServerApp == .ollama && keepAliveMinutes > 0 ? "\(keepAliveMinutes)m" : nil
@@ -145,12 +172,18 @@ final class OpenAICompatibleCleanupProvider: CleanupProvider {
         let model = self.model
         let apiKey = self.apiKey
         let localServerApp = self.localServerApp
-        let localServerEndpoint = self.localServerEndpoint
         let loadLocalContext = self.loadLocalContext
+        let readLocalServer = self.readLocalServer
+        let lifecycle = self.lifecycle
+        let target = lifecycleTarget
         let timeout = self.timeout
         let work: @Sendable () async throws -> ChatCompletionsTransport.Completion = {
-            if localServerApp == .lmStudio, contextTokens > 0, let localServerEndpoint {
-                _ = await loadLocalContext(localServerEndpoint, model, contextTokens)
+            if localServerApp == .lmStudio, contextTokens > 0 {
+                if let lease, let target {
+                    await lifecycle.reconcileLMStudio(
+                        target: target, contextTokens: contextTokens, lease: lease,
+                        read: readLocalServer, load: loadLocalContext)
+                }
             }
 
             if localServerApp == .ollama, contextTokens > 0 {
@@ -279,7 +312,7 @@ struct ChatCompletionsTransport: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await CleanupSendHandoff.data(for: request, session: session)
         } catch {
             throw Self.transportFailure(error)
         }
@@ -325,7 +358,7 @@ struct ChatCompletionsTransport: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let bearerToken, !bearerToken.isEmpty {
-            request.setValue("******", forHTTPHeaderField: "Authorization")
+            request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try JSONEncoder().encode(
             ResponsesRequest(
@@ -341,7 +374,7 @@ struct ChatCompletionsTransport: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await CleanupSendHandoff.data(for: request, session: session)
         } catch {
             throw Self.transportFailure(error)
         }
@@ -379,6 +412,7 @@ struct ChatCompletionsTransport: Sendable {
         at url: URL,
         model: String,
         bearerToken: String?,
+        apiKey: String? = nil,
         temperature: Double?,
         reasoningEffort: String? = nil,
         promptCacheMode: String? = nil,
@@ -395,6 +429,9 @@ struct ChatCompletionsTransport: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let bearerToken, !bearerToken.isEmpty {
             request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        }
+        if let apiKey, !apiKey.isEmpty {
+            request.setValue(apiKey, forHTTPHeaderField: "api-key")
         }
         request.httpBody = try JSONEncoder().encode(
             ChatCompletionRequest(
@@ -416,7 +453,7 @@ struct ChatCompletionsTransport: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await CleanupSendHandoff.data(for: request, session: session)
         } catch {
             throw Self.transportFailure(error)
         }
@@ -451,7 +488,7 @@ struct ChatCompletionsTransport: Sendable {
     /// A failed `URLSession` call as a cleanup failure. A cancelled task stays a `CancellationError`, so a caller can
     /// tell a shutdown from a failure, and a URL error keeps only its code, never the failing URL its user info holds.
     static func transportFailure(_ error: any Error) -> any Error {
-        if error is CancellationError {
+        if error is CancellationError || error is CleanupSendHandoff.Refusal {
             return error
         }
         guard let urlError = error as? URLError else {

@@ -33,6 +33,7 @@ struct CleanupConnection: Hashable, Sendable, CustomStringConvertible, CustomRef
 
     let target: Target
     let source: CleanupConfigurationSource
+    var localModelIdleMinutes = LocalModelDefaults.keepAliveMinutes
 
     var kind: CleanupProviderKind { target.kind }
 
@@ -77,6 +78,7 @@ struct CleanupProviderFactory: Sendable {
     var now: @Sendable () -> Date
     /// Elapsed time, for how long Foundry Local's endpoint is trusted.
     var monotonicNow: @Sendable () -> ContinuousClock.Instant
+    var localModelLifecycle: LocalModelLifecycle = .shared
 
     static var live: CleanupProviderFactory {
         CleanupProviderFactory(
@@ -121,6 +123,39 @@ enum CleanupProviderResolver {
         return try settingsConnection(store.snapshot())
     }
 
+    static func connection(
+        candidate: CleanupConnectionCandidate, store: CleanupSettingsStore
+    ) throws -> CleanupConnection {
+        var settings = store.snapshot()
+        let values = candidate.settings
+        settings.isEnabled = values.isEnabled
+        settings.providerKind = values.providerKind
+        settings.foundryLocalModelAlias = values.foundryLocalModelAlias
+        settings.ollamaModel = values.ollamaModel
+        settings.selectedLocalApp = values.selectedLocalApp
+        settings.openAIBaseURL = values.openAIBaseURL
+        settings.openAIModel = values.openAIModel
+        settings.openAIApiStyle = values.openAIApiStyle
+        settings.ollamaContextTokens = values.ollamaContextTokens
+        settings.lmStudioContextTokens = values.lmStudioContextTokens
+        settings.foundryLocalSendWholeVocabulary = values.foundryLocalSendWholeVocabulary
+        settings.ollamaSendWholeVocabulary = values.ollamaSendWholeVocabulary
+        settings.lmStudioSendWholeVocabulary = values.lmStudioSendWholeVocabulary
+        settings.otherServiceApiStyle = values.otherServiceApiStyle
+        settings.azureEndpoint = values.azureEndpoint
+        settings.azureDeployment = values.azureDeployment
+        settings.azurePromptCaching = values.azurePromptCaching
+        settings.azureAuthMode = values.azureAuthMode
+        settings.azureApiKeySelected = values.azureApiKeySelected
+        settings.azureTenantId = values.azureTenantId
+        settings.azureClientId = values.azureClientId
+        settings.writingStyle = candidate.writingStyle
+        settings.frontierPrompt = candidate.frontierPrompt
+        settings.localPrompt = candidate.localPrompt
+        settings.localModelIdleMinutes = values.localModelIdleMinutes
+        return try settingsConnection(settings)
+    }
+
     /// How `makeProvider` comes by the Microsoft Foundry credential for an identity. `make` builds a new one, reading
     /// a service principal's secret; a caller that holds one for the identity may return that instead, as
     /// `CleanupProviderCache` does, so a provider rebuilt for the same identity keeps its token.
@@ -135,6 +170,10 @@ enum CleanupProviderResolver {
         store: CleanupSettingsStore,
         environment: [String: String],
         factory: CleanupProviderFactory,
+        lifecycle: LocalModelLifecycle? = nil,
+        openAIApiKeyOverride: String? = nil,
+        azureClientSecretOverride: String? = nil,
+        azureApiKeyOverride: String? = nil,
         credentialSource: CredentialSource
     ) throws -> any CleanupProvider {
         switch connection.target {
@@ -145,6 +184,8 @@ enum CleanupProviderResolver {
         case .ollama(let model):
             return ManagedOllamaCleanupProvider(
                 model: model,
+                keepAliveMinutes: connection.localModelIdleMinutes,
+                lifecycle: lifecycle ?? factory.localModelLifecycle,
                 readLocalServer: { endpoint in await factory.readLocalServer(endpoint, nil) },
                 session: factory.session)
         case .openAICompatible(let serviceURL, let model, let keySource, let apiStyle):
@@ -153,7 +194,7 @@ enum CleanupProviderResolver {
             case .environment:
                 apiKey = environment["SCRIBE_CLEANUP_API_KEY"]
             case .secretStore:
-                apiKey = try readSecret { try store.readOpenAIApiKey() }
+                apiKey = try openAIApiKeyOverride ?? readSecret { try store.readOpenAIApiKey() }
             }
             let localServerApp: LocalServerApp
             if connection.source == .settings {
@@ -170,15 +211,34 @@ enum CleanupProviderResolver {
                 serviceURL: serviceURL,
                 apiStyle: apiStyle,
                 localServerApp: localServerApp,
+                keepAliveMinutes: connection.localModelIdleMinutes,
+                lifecycle: lifecycle ?? factory.localModelLifecycle,
                 localTuning: {
                     connection.source == .settings ? LocalModelTuning.forSettings(store.snapshot()) : .none
                 },
                 readLocalServer: factory.readLocalServer,
                 session: factory.session)
         case .microsoftFoundry(let inferenceBase, let deployment, let identity):
+            if case .apiKey = identity {
+                let apiKey = try azureApiKeyOverride ?? readSecret { try store.readAzureApiKey() }
+                guard let apiKey, !apiKey.isEmpty else {
+                    throw CleanupProviderError.notConfigured(.azureApiKeyMissing, source: connection.source)
+                }
+                return MicrosoftFoundryCleanupProvider(
+                    inferenceBase: inferenceBase,
+                    deployment: deployment,
+                    promptCachingEnabled: { connection.source == .settings ? store.azurePromptCaching : true },
+                    apiKey: apiKey,
+                    session: factory.session)
+            }
             let credential = try credentialSource(identity) {
                 try makeCredential(
-                    for: identity, store: store, source: connection.source, environment: environment, factory: factory)
+                    for: identity,
+                    store: store,
+                    source: connection.source,
+                    environment: environment,
+                    factory: factory,
+                    clientSecretOverride: azureClientSecretOverride)
             }
             return MicrosoftFoundryCleanupProvider(
                 inferenceBase: inferenceBase, deployment: deployment, credential: credential, session: factory.session)
@@ -241,6 +301,12 @@ enum CleanupProviderResolver {
     }
 
     private static func settingsConnection(_ settings: CleanupSettingsSnapshot) throws -> CleanupConnection {
+        var connection = try settingsTargetConnection(settings)
+        connection.localModelIdleMinutes = settings.localModelIdleMinutes
+        return connection
+    }
+
+    private static func settingsTargetConnection(_ settings: CleanupSettingsSnapshot) throws -> CleanupConnection {
         let source = CleanupConfigurationSource.settings
         switch settings.providerKind {
         case .foundryLocal:
@@ -259,6 +325,7 @@ enum CleanupProviderResolver {
                 endpoint: settings.azureEndpoint,
                 deployment: settings.azureDeployment,
                 authMode: settings.azureAuthMode,
+                apiKeySelected: settings.azureApiKeySelected,
                 tenantId: settings.azureTenantId,
                 clientId: settings.azureClientId,
                 secretRevision: settings.secretRevision,
@@ -321,6 +388,7 @@ enum CleanupProviderResolver {
         endpoint: String?,
         deployment: String?,
         authMode: AzureAuthMode,
+        apiKeySelected: Bool = false,
         tenantId: String?,
         clientId: String?,
         secretRevision: String,
@@ -337,23 +405,27 @@ enum CleanupProviderResolver {
         guard let deployment = trimmed(deployment) else {
             throw CleanupProviderError.notConfigured(.azureDeploymentMissing, source: source)
         }
-        let tenant = trimmed(tenantId)
+        let tenant = apiKeySelected ? nil : trimmed(tenantId)
         if let tenant, !AzureTenant.isValid(tenant) {
             throw CleanupProviderError.notConfigured(.azureTenantInvalid, source: source)
         }
 
         let identity: AzureIdentity
-        switch authMode {
-        case .azureCli:
-            identity = .azureCli(tenantId: tenant)
-        case .servicePrincipal:
-            guard let clientId = trimmed(clientId) else {
-                throw CleanupProviderError.notConfigured(.azureClientIdMissing, source: source)
+        if apiKeySelected {
+            identity = .apiKey
+        } else {
+            switch authMode {
+            case .azureCli:
+                identity = .azureCli(tenantId: tenant)
+            case .servicePrincipal:
+                guard let clientId = trimmed(clientId) else {
+                    throw CleanupProviderError.notConfigured(.azureClientIdMissing, source: source)
+                }
+                guard let tenant else {
+                    throw CleanupProviderError.notConfigured(.azureTenantMissing, source: source)
+                }
+                identity = .servicePrincipal(tenantId: tenant, clientId: clientId, secretRevision: secretRevision)
             }
-            guard let tenant else {
-                throw CleanupProviderError.notConfigured(.azureTenantMissing, source: source)
-            }
-            identity = .servicePrincipal(tenantId: tenant, clientId: clientId, secretRevision: secretRevision)
         }
         return CleanupConnection(
             target: .microsoftFoundry(inferenceBase: inferenceBase, deployment: deployment, identity: identity),
@@ -367,7 +439,8 @@ enum CleanupProviderResolver {
         store: CleanupSettingsStore,
         source: CleanupConfigurationSource,
         environment: [String: String],
-        factory: CleanupProviderFactory
+        factory: CleanupProviderFactory,
+        clientSecretOverride: String?
     ) throws -> any AzureCredentialProvider {
         switch identity {
         case .azureCli(let tenantId):
@@ -376,13 +449,16 @@ enum CleanupProviderResolver {
                 launch: factory.azureCliLaunch, now: factory.now)
         case .servicePrincipal(let tenantId, let clientId, _):
             let configured = configuredClientId(clientId, source: source, store: store, environment: environment)
-            let secret = try readSecret { try store.readAzureClientSecret(clientId: configured) }
+            let secret =
+                try clientSecretOverride ?? readSecret { try store.readAzureClientSecret(clientId: configured) }
             guard let secret, !secret.isEmpty else {
                 throw CleanupProviderError.notConfigured(.azureClientSecretMissing, source: source)
             }
             return AzureServicePrincipalCredentialProvider(
                 principal: AzureServicePrincipal(tenantId: tenantId, clientId: clientId, clientSecret: secret),
                 session: factory.session, now: factory.now)
+        case .apiKey:
+            throw CleanupProviderError.notConfigured(.azureApiKeyMissing, source: source)
         }
     }
 

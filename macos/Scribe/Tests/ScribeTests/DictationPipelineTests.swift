@@ -448,6 +448,38 @@ final class DictationPipelineTests: XCTestCase {
         XCTAssertEqual(provider.requests.count, 1, "a provider that could not be built was sent a request")
     }
 
+    func testLocalReadinessFailureFallsBackToRawTranscriptWithoutSendingCleanup() async throws {
+        let harness = makeHarness()
+        harness.cleanup.isEnabled = true
+        harness.cleanup.readinessResult = .failed
+        harness.transcriber.defaultText = "keep every word"
+
+        await harness.dictate()
+        await harness.waitUntilProcessed()
+
+        XCTAssertEqual(harness.fakeInjector.texts, ["keep every word "])
+        XCTAssertEqual(harness.reports.latest?.cleanupOutcome, .fellBack)
+        XCTAssertTrue(harness.cleanup.gated?.requests.isEmpty == true)
+        XCTAssertTrue(harness.presenter.noticesShown().contains(.typedWithoutCleanup))
+    }
+
+    func testPillNamesTheLocalModelWhileItIsStarting() async throws {
+        let harness = makeHarness()
+        let readiness = DictationGate<LocalModelPreparationResult>()
+        harness.cleanup.isEnabled = true
+        harness.cleanup.readinessGate = readiness
+
+        _ = try await harness.pressAdmitted()
+        await harness.waitUntilLive()
+        harness.release()
+        await waitUntil("local model readiness is visible") {
+            harness.lastOverlay == .startingLocalModel
+        }
+
+        readiness.open(.started)
+        await harness.waitUntilProcessed()
+    }
+
     /// With cleanup switched off nothing is sent, and the switch is read when the dictation reaches cleanup.
     func testCleanupSwitchedOffSendsNothing() async throws {
         let harness = makeHarness()
@@ -536,8 +568,8 @@ final class DictationPipelineTests: XCTestCase {
 
     // MARK: - Nothing to insert
 
-    /// An empty transcript is nothing to insert: no delivery, no history entry, no notice, no notification.
-    func testAnEmptyTranscriptIsNothingToInsertAndQuiet() async {
+    /// No words on real audio are a recognition problem, not a successful empty dictation.
+    func testAnEmptyTranscriptOnRealAudioSaysNoWordsRecognized() async {
         let harness = makeHarness()
         harness.transcriber.defaultText = "   "
 
@@ -546,10 +578,10 @@ final class DictationPipelineTests: XCTestCase {
 
         XCTAssertTrue(harness.fakeInjector.deliveries.isEmpty)
         XCTAssertTrue(harness.history.records.isEmpty)
-        XCTAssertTrue(harness.presenter.noticesShown().isEmpty)
-        XCTAssertTrue(harness.notifier.notices.isEmpty)
+        XCTAssertEqual(harness.presenter.noticesShown(), [.noWordsRecognized])
+        XCTAssertEqual(harness.notifier.notices.map(\.kind), [.noWordsRecognized])
         XCTAssertTrue(harness.recovery.recent().isEmpty)
-        XCTAssertEqual(harness.lastOverlay, .hidden)
+        XCTAssertEqual(harness.reports.latest?.failureStage, .decode)
     }
 
     /// A missing recognizer says so without an alert, and the next dictation looks for it again.

@@ -94,10 +94,9 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
   dictation, Settings, AI Cleanup/Pause toggles, Recent Dictations, Quick Add to Dictionary,
   Welcome, and Quit
 - Global push-to-talk hotkey, real audio capture, and text injection into the app that had focus when the
-  recording started. Scribe inserts through Accessibility where it can; otherwise it borrows the clipboard
-  only when it is empty or holds plain text, keeps its own copy off Universal Clipboard and marks it so
-  clipboard history tools skip it, and puts your text back only if nothing replaced it in the meantime.
-  With anything else on the clipboard it types the text instead. If focus moves to another app before or
+  recording started. Scribe types Unicode keyboard events directly, matching Windows' default, without
+  changing your clipboard or writing the editor's Accessibility text attributes. Accessibility permission
+  is still required for keyboard events and focus checks. If focus moves to another app before or
   while the text is going in, Scribe stops and keeps the dictation for recovery
 - The dictation pipeline: raw speech recognition; with AI cleanup on, every replacement decided on that
   transcript exactly as cleanup off would make it, your dictionary and library spellings made in the text sent
@@ -135,8 +134,19 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
 - Overlay pill with a 9-anchor position picker and live recording/processing state, and a short notice
   that names what went wrong (for example "Cleanup failed, raw text used" or "Not inserted, text kept").
   A notice never covers a recording and never replaces a newer failure; one that cannot be shown waits
-  for the pill, and a cleanup fallback or failed transcription that cannot be shown at once is posted as
-  a notification instead. No modal alerts while you dictate
+  for the pill. Microphone, empty-audio and recognition problems also have plain-language notifications,
+  once per problem episode, reset when that stage works again or the saved microphone or shortcut changes.
+  A cleanup fallback that cannot be shown at once is posted once until cleanup recovers or its setup changes.
+  Every failed insertion still has its own Copy Transcript recovery action; those are never suppressed.
+  Known near-silent audio is not sent to the recognizer, and an empty recognition on real audio says
+  "No words recognized", rather than disappearing. No modal alerts while you dictate
+- If a chosen microphone is unavailable, Scribe says when it uses the system default instead, once until the
+  chosen microphone works again or the saved selection changes. A selection that cannot be confirmed says so
+  without claiming which microphone recorded. Recent Dictations reports whether copying succeeded; Quick Add
+  says "Saved to your dictionary" only once the new rules are in use, otherwise "Saved, but not in use yet".
+  Notifications contain no dictated text. Copy Transcript retains only the last five texts in memory and
+  Clear history withdraws those copies. See the [notice trigger matrix](PORTING-PLAN.md#tray-and-dictation-notices)
+  for the Windows mapping and platform-specific limits
 - Releasing the key never waits for the recording to be finished off: that happens in the background,
   and dictations are still processed in the order you spoke them
 - Quitting hides the pill at once, then waits for a paste in progress to put your clipboard back, and for a
@@ -147,6 +157,24 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
   sidebar, opens matching pages and scrolls to matching cards; a change made from the tray shows in
   an open window, Open at Login shows what macOS reports, and no tab waits on the database on the
   main thread
+- Settings has a persistent unsaved-changes footer. Pending voice snippet and app profile input,
+  credential input and word pack edits are kept across page navigation; Save uses their existing
+  stores, Discard changes clears pending input, and the window's Close button or Command-W asks
+  Save / Discard changes / Keep editing. Keep editing is the default. A failed save stays open,
+  keeps uncommitted edits and shows its error in the footer. Settings that already apply immediately
+  on macOS, including tray choices, Open at Login, dictation controls, history retention and existing
+  dictionary/snippet/profile row actions, stay immediate and are not rolled back by Discard.
+  `SettingsWindowController.prepareForApplicationTermination()` reuses the same decisions for quit
+  or restart, waits for pending saves/adds, shares an already-open close prompt, and returns false
+  on Keep editing, save failure or newer edits. It leaves Settings editable on refusal. The lifecycle
+  owner must await it before starting shutdown or scheduling a restart; this branch deliberately does
+  not wire AppDelegate, so application-wide protection is not complete until that hook is integrated.
+- History shows the newest 200 stored dictations, with copy and confirmed per-item delete. Search
+  runs asynchronously against every stored dictation's text and recorded app identity before limiting
+  the displayed matches to 200, with a visible "first 200 matches, newest first" disclosure.
+  Search is debounced; late results cannot replace a newer query, and
+  Clear search restores the recent list. Delete and Delete all history refresh the active query and
+  invalidate the existing recovery UI through the same history-cleared callback.
 - User dictionary (CSV import/export, history-mined suggestions, unused-entry cleanup), Word packs
   (all 11 built-in packs, custom CSV import/export, staged editing with undo, redo, save and discard,
   per-pack AI vocabulary permission), voice snippets, and per-app profiles (writing style + newline
@@ -157,6 +185,10 @@ Privacy & Security), and a one-time Welcome window explains the push-to-talk ges
   built once per configuration and reused across dictations, Test Connection sends a real
   cleanup request for a test word and passes only if the model answers with text, and em and en
   dashes are rewritten out of the model's answer
+- For Ollama and LM Studio on this Mac, each recording checks whether the selected model is resident at the needed
+  context size; only a missing or differently sized model gets a fixed local readying request. It contains no dictated
+  text or vocabulary, has a bounded wait, and a failure leaves dictation text intact while cleanup is skipped. Cleanup
+  failure notifications use plain language and are suppressed until cleanup recovers or its configuration changes.
 - Diagnostics (P50/P95 decode latency, real-time factor) and Usage Insights (totals, trend chart,
   top apps, recurring terms with one-click dictionary add, and an opt-in AI summary that sends only your
   totals and the recurring terms that are dictionary spellings: never a word mined from your dictations,
@@ -238,8 +270,9 @@ swift format lint --strict --recursive --configuration macos/Scribe/.swift-forma
 See `PORTING-PLAN.md` for the parity table and the authoritative, row-by-row feature checklist. As of this writing
 the main outstanding gaps are: the default speech model is English-only; long recordings are transcribed in one
 call rather than split on pauses as Windows does; there is no voice activity detection trimming the capture before
-recognition; the Settings page structure, Find a setting and the Word packs editor now match Windows; the "Starting
-local model" state and the full memory release of Ollama and LM Studio models are not ported; and there is no
+recognition; the Settings page structure, Find a setting and the Word packs editor now match Windows; automatic
+readiness for Ollama and LM Studio, including the "Starting local model" state, is now ported, but the full idle and
+pause memory-release policy for those models is not; and there is no
 auto-update story yet. Dev
 builds use a local self-signed certificate, and public releases use the Developer ID pipeline documented above. Since
 Windows 0.4.3 the port has gained the space after each dictation, the new recording indicator, Ollama and LM Studio

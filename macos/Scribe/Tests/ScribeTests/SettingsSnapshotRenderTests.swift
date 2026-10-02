@@ -33,12 +33,16 @@ final class SettingsSnapshotRenderTests: XCTestCase {
 
         let defaults = makeIsolatedDefaults(label: "settings-snapshots")
         let cleanupAccess = makeCleanupAccess(defaults: defaults)
+        let libraryService = DictionaryLibraryService(
+            librariesDirectory: scratchURL.appendingPathComponent("Libraries", isDirectory: true),
+            settings: DictionaryLibrarySettings(defaults: defaults.defaults),
+            persistenceStore: persistenceStore)
         let drafts = SettingsDrafts()
         let dependencies = SnapshotDependencies(
             persistenceStore: persistenceStore,
             overlayPanelController: OverlayPanelController(),
             pipelineReportStore: PipelineReportStore(),
-            dictionaryLibraryService: DictionaryLibraryService(),
+            dictionaryLibraryService: libraryService,
             drafts: drafts,
             defaults: defaults.defaults,
             cleanupAccess: cleanupAccess,
@@ -54,6 +58,9 @@ final class SettingsSnapshotRenderTests: XCTestCase {
             try render(section, dependencies: dependencies, appearance: .aqua, to: url)
             rendered.append(url)
         }
+        let wordPacksLight = outputURL.appendingPathComponent("wordPacksTab-light.png", isDirectory: false)
+        try renderWordPacks(dependencies: dependencies, appearance: .aqua, to: wordPacksLight)
+        rendered.append(wordPacksLight)
 
         for section in SettingsSection.allCases {
             drafts.section = section
@@ -61,6 +68,17 @@ final class SettingsSnapshotRenderTests: XCTestCase {
             try render(section, dependencies: dependencies, appearance: .darkAqua, to: url)
             rendered.append(url)
         }
+        let wordPacksDark = outputURL.appendingPathComponent("wordPacksTab-dark.png", isDirectory: false)
+        try renderWordPacks(dependencies: dependencies, appearance: .darkAqua, to: wordPacksDark)
+        rendered.append(wordPacksDark)
+
+        let searchLight = outputURL.appendingPathComponent("search-results-light.png", isDirectory: false)
+        try render(.dictation, dependencies: dependencies, appearance: .aqua, searchQuery: "model", to: searchLight)
+        rendered.append(searchLight)
+
+        let searchDark = outputURL.appendingPathComponent("search-results-dark.png", isDirectory: false)
+        try render(.dictation, dependencies: dependencies, appearance: .darkAqua, searchQuery: "model", to: searchDark)
+        rendered.append(searchDark)
 
         for url in rendered {
             try assertPNGIsNotBlank(url)
@@ -157,6 +175,7 @@ final class SettingsSnapshotRenderTests: XCTestCase {
         _ section: SettingsSection,
         dependencies: SnapshotDependencies,
         appearance: NSAppearance.Name,
+        searchQuery: String = "",
         to url: URL
     ) throws {
         let colorScheme: ColorScheme = appearance == .darkAqua ? .dark : .light
@@ -168,7 +187,7 @@ final class SettingsSnapshotRenderTests: XCTestCase {
         window.appearance = NSAppearance(named: appearance)
         window.backgroundColor = NSColor.windowBackgroundColor
         window.contentView = NSHostingView(
-            rootView: SnapshotSettingsShell(selection: section, dependencies: dependencies)
+            rootView: SnapshotSettingsShell(selection: section, dependencies: dependencies, searchQuery: searchQuery)
                 .environment(\.colorScheme, colorScheme))
         window.layoutIfNeeded()
 
@@ -187,6 +206,45 @@ final class SettingsSnapshotRenderTests: XCTestCase {
         view.cacheDisplay(in: bounds, to: representation)
         guard let png = representation.representation(using: .png, properties: [:]) else {
             XCTFail("Could not encode \(section.rawValue) as PNG")
+            return
+        }
+        try png.write(to: url, options: .atomic)
+        Self.retainedWindows.append(window)
+    }
+
+    private func renderWordPacks(
+        dependencies: SnapshotDependencies,
+        appearance: NSAppearance.Name,
+        to url: URL
+    ) throws {
+        let colorScheme: ColorScheme = appearance == .darkAqua ? .dark : .light
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: imageSize),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false)
+        window.appearance = NSAppearance(named: appearance)
+        window.backgroundColor = NSColor.windowBackgroundColor
+        window.contentView = NSHostingView(
+            rootView: SnapshotWordPacksShell(dependencies: dependencies)
+                .environment(\.colorScheme, colorScheme))
+        window.layoutIfNeeded()
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        guard let view = window.contentView else {
+            XCTFail("Word packs snapshot window has no content view")
+            return
+        }
+        let bounds = view.bounds
+        guard let representation = view.bitmapImageRepForCachingDisplay(in: bounds) else {
+            XCTFail("Could not create bitmap for Word packs")
+            return
+        }
+        view.cacheDisplay(in: bounds, to: representation)
+        guard let png = representation.representation(using: .png, properties: [:]) else {
+            XCTFail("Could not encode Word packs as PNG")
             return
         }
         try png.write(to: url, options: .atomic)
@@ -230,6 +288,13 @@ private struct SnapshotDependencies {
 private struct SnapshotSettingsShell: View {
     let selection: SettingsSection
     let dependencies: SnapshotDependencies
+    let searchQuery: String
+
+    init(selection: SettingsSection, dependencies: SnapshotDependencies, searchQuery: String = "") {
+        self.selection = selection
+        self.dependencies = dependencies
+        self.searchQuery = searchQuery
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -250,13 +315,17 @@ private struct SnapshotSettingsShell: View {
     }
 
     private var sidebar: some View {
-        List {
-            ForEach(SettingsSection.topLevel) { section in row(section) }
-            Section("Personalize") { ForEach(SettingsSection.personalize) { section in row(section) } }
-            Section("Review") { ForEach(SettingsSection.review) { section in row(section) } }
-            Section("More") { ForEach(SettingsSection.more) { section in row(section) } }
+        VStack(spacing: 0) {
+            SnapshotSearchHeader(query: searchQuery)
+            Divider()
+            List {
+                ForEach(SettingsSection.topLevel) { section in row(section) }
+                Section("Personalize") { ForEach(SettingsSection.personalize) { section in row(section) } }
+                Section("Review") { ForEach(SettingsSection.review) { section in row(section) } }
+                Section("More") { ForEach(SettingsSection.more) { section in row(section) } }
+            }
+            .listStyle(.sidebar)
         }
-        .listStyle(.sidebar)
     }
 
     private func row(_ section: SettingsSection) -> some View {
@@ -318,5 +387,79 @@ private struct SnapshotSettingsShell: View {
         case .about:
             SettingsAboutPage(persistenceStore: dependencies.persistenceStore)
         }
+    }
+}
+
+@MainActor
+private struct SnapshotSearchHeader: View {
+    let query: String
+
+    private var results: [SettingsSearchResult] {
+        SettingsSearchIndex.search(query)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Find a setting")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(Color(nsColor: .textBackgroundColor))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(Color(nsColor: .separatorColor).opacity(0.45), lineWidth: 1)
+                )
+            if !query.isEmpty {
+                ForEach(results.prefix(4), id: \.entry.id) { result in
+                    Text(result.displayText)
+                        .font(.caption)
+                        .lineLimit(2)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.accentColor.opacity(result == results.first ? 0.18 : 0))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+        }
+        .padding(10)
+    }
+}
+
+@MainActor
+private struct SnapshotWordPacksShell: View {
+    let dependencies: SnapshotDependencies
+
+    var body: some View {
+        ScrollView {
+            SettingsPage(
+                title: "Dictionary",
+                subtitle: "Teach Scribe how to write the words it hears, like \"dot net\" as .NET."
+            ) {
+                HStack(spacing: 10) {
+                    Label("Your words", systemImage: "person.text.rectangle")
+                        .padding(12)
+                        .foregroundStyle(.secondary)
+                    Label("Word packs", systemImage: "shippingbox")
+                        .padding(12)
+                        .background(Color.accentColor.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                SettingsCard {
+                    DictionaryWordPacksSettingsTab(
+                        dictionaryLibraryService: dependencies.dictionaryLibraryService,
+                        onChanged: {})
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(width: 1_000, height: 760)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
